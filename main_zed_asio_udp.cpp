@@ -303,6 +303,7 @@ int main(int argc, char *argv[]) {
     pipeline_str += "t. ! queue ! "
                     "nvvidconv ! videoconvert ! "
                     "autovideosink sync=false ";
+    encoding_enabled = true;
   }
 
   // Launch pipeline
