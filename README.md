@@ -1,6 +1,11 @@
 # XRoboToolkit-Orin-Video-Sender
 Video Previewer/Encoder/Sender on Nvidia Jetson Orin Platform
 
+![Screenshot](Docs/screenshot.png)
+> Sender (Webcam): `./OrinVideoSender --preview --send --server 192.168.1.176 --port 12345`
+
+> Receiver (Video-Viewer): TCP - 192.168.1.176 - 12345 - 1280x720
+
 ## Features
 
 - Support Webcam and ZED cameras
@@ -20,7 +25,7 @@ Video Previewer/Encoder/Sender on Nvidia Jetson Orin Platform
 
 make
 
-OrinVideoSender --help
+./OrinVideoSender --help
 ```
 
 ## One More Thing 
