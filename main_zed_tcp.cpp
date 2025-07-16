@@ -199,6 +199,7 @@ std::atomic<bool> stop_requested{false};
 std::atomic<bool> streaming_active{false};
 std::atomic<bool> encoding_enabled{false};
 std::atomic<bool> send_enabled{false};
+std::atomic<bool> preview_enabled{false};
 
 // Thread management
 std::unique_ptr<std::thread> listen_thread;
@@ -621,7 +622,7 @@ int main(int argc, char *argv[]) {
   signal(SIGINT, handle_sigint);
 
   // Parse command line arguments
-  bool preview_enabled = false;
+  bool preview_enabled_local = false;
   bool listen_enabled = false;
   bool send_enabled_mode = false;
   std::string listen_address = "";
@@ -629,7 +630,7 @@ int main(int argc, char *argv[]) {
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     if (arg == "--preview") {
-      preview_enabled = true;
+      preview_enabled_local = true;
     } else if (arg == "--listen" && i + 1 < argc) {
       listen_enabled = true;
       listen_address = argv[++i];
@@ -671,6 +672,9 @@ int main(int argc, char *argv[]) {
     std::cout << "Starting direct video streaming to " << send_to_server << ":"
               << send_to_port << "..." << std::endl;
 
+    // Set global preview flag
+    preview_enabled.store(preview_enabled_local);
+
     // Set up default camera configuration for direct streaming
     {
       std::lock_guard<std::mutex> lock(config_mutex);
@@ -696,6 +700,9 @@ int main(int argc, char *argv[]) {
     }
   } else if (listen_enabled) {
     std::cout << "Starting threaded video streaming server..." << std::endl;
+
+    // Set global preview flag
+    preview_enabled.store(preview_enabled_local);
 
     // Start listening thread
     listen_thread =
@@ -780,18 +787,32 @@ void streamingThreadFunction() {
     // Build GStreamer pipeline
     std::string pipeline_str;
     if (config.width > 0 && config.height > 0) {
-      pipeline_str = buildPipelineString(config, false);
+      pipeline_str = buildPipelineString(config, preview_enabled.load());
       std::cout << "Pipeline from command: " << pipeline_str << std::endl;
     } else {
       // Default pipeline
-      pipeline_str =
-          "appsrc name=mysource is-live=true format=time "
-          "caps=video/x-raw,format=BGRA,width=2560,height=720,framerate=60/1 ! "
-          "videoconvert ! nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
-          "tee name=t "
-          "t. ! queue ! nvv4l2h264enc maxperf-enable=1 insert-sps-pps=true "
-          "idrinterval=15 bitrate=4000000 ! h264parse ! appsink name=mysink "
-          "emit-signals=true sync=false ";
+      if (preview_enabled.load()) {
+        pipeline_str =
+            "appsrc name=mysource is-live=true format=time "
+            "caps=video/x-raw,format=BGRA,width=2560,height=720,framerate=60/1 "
+            "! "
+            "videoconvert ! nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
+            "tee name=t "
+            "t. ! queue ! nvv4l2h264enc maxperf-enable=1 insert-sps-pps=true "
+            "idrinterval=15 bitrate=4000000 ! h264parse ! appsink name=mysink "
+            "emit-signals=true sync=false "
+            "t. ! queue ! nvvidconv ! videoconvert ! autovideosink sync=false ";
+      } else {
+        pipeline_str =
+            "appsrc name=mysource is-live=true format=time "
+            "caps=video/x-raw,format=BGRA,width=2560,height=720,framerate=60/1 "
+            "! "
+            "videoconvert ! nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
+            "tee name=t "
+            "t. ! queue ! nvv4l2h264enc maxperf-enable=1 insert-sps-pps=true "
+            "idrinterval=15 bitrate=4000000 ! h264parse ! appsink name=mysink "
+            "emit-signals=true sync=false ";
+      }
     }
 
     // Launch pipeline
