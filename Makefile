@@ -21,17 +21,17 @@ APP := OrinVideoSender
 ###############################################################################
 # ZED
 
-# TCP w/o asio -- pass
-SRCS := \
-	main_zed_tcp.cpp
+# # TCP w/o asio -- pass
+# SRCS := \
+# 	main_zed_tcp.cpp
 
 # # TCP with asio -- pass
 # SRCS := \
 # 	main_zed_asio.cpp
 
-# # UDP w/ asio -- pass
-# SRCS:= \
-# 	main_zed_asio_udp.cpp
+# UDP w/ asio -- pass
+SRCS:= \
+	main_zed_asio_udp.cpp
 
 # # [NOT WORKING] Zero Copy - depends on jetson multimedia api
 # SRCS := \
@@ -67,7 +67,8 @@ LDFLAGS += -lsl_zed \
 	-lcuda -lcudart \
 	-lopencv_core -lopencv_imgproc -lopencv_videoio -lopencv_imgcodecs \
 	-lssl -lcrypto \
-	-lpthread
+	-lpthread \
+	-lstdc++
 
 # GStreamer libraries
 LDFLAGS += $(shell pkg-config --libs gstreamer-1.0 gstreamer-app-1.0 glib-2.0 2>/dev/null || echo "-lgstreamer-1.0 -lgstapp-1.0 -lglib-2.0")
