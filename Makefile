@@ -13,17 +13,17 @@ APP := OrinVideoSender
 ###############################################################################
 # WebCam
 
-# TCP w/o asio -- pass
-SRCS := \
-	main_web_gst.cpp
+# # TCP w/o asio -- pass
+# SRCS := \
+# 	main_web_gst.cpp
 ###############################################################################
 
 ###############################################################################
 # ZED
 
-# # TCP w/o asio -- pass
-# SRCS := \
-# 	main_zed_tcp.cpp
+# TCP w/o asio -- pass
+SRCS := \
+	main_zed_tcp.cpp
 
 # # TCP with asio -- pass
 # SRCS := \
