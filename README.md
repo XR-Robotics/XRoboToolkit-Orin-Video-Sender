@@ -23,7 +23,12 @@ make
 ./OrinVideoSender --help
 
 # Listen to coming command from VR, 192.168.1.153 is the Orin IP address
+# Add `--preview` to show the video on Orin if necessary 
 ./OrinVideoSender --listen 192.168.1.153:13579
+
+# Direct send the video stream # 192.168.1.176 is the VR headset IP
+# Add `--preview` to show the video on Orin if necessary 
+./OrinVideoSender --send --server 192.168.1.176 --port 12345
 ```
 
 ## One More Thing 
