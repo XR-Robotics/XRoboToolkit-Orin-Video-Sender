@@ -623,6 +623,7 @@ int main(int argc, char *argv[]) {
   // Parse command line arguments
   bool preview_enabled = false;
   bool listen_enabled = false;
+  bool send_enabled_mode = false;
   std::string listen_address = "";
 
   for (int i = 1; i < argc; ++i) {
@@ -632,6 +633,8 @@ int main(int argc, char *argv[]) {
     } else if (arg == "--listen" && i + 1 < argc) {
       listen_enabled = true;
       listen_address = argv[++i];
+    } else if (arg == "--send") {
+      send_enabled_mode = true;
     } else if (arg == "--server" && i + 1 < argc) {
       send_to_server = argv[++i];
     } else if (arg == "--port" && i + 1 < argc) {
@@ -642,42 +645,79 @@ int main(int argc, char *argv[]) {
       std::cout << "  --preview      Enable video preview\n";
       std::cout << "  --listen ADDR  Listen to control commands on address "
                    "(IP:PORT)\n";
-      std::cout << "  --server IP    Default server IP address\n";
-      std::cout << "  --port PORT    Default server port\n";
+      std::cout << "  --send         Send video stream directly to server\n";
+      std::cout << "  --server IP    Server IP address\n";
+      std::cout << "  --port PORT    Server port\n";
       std::cout << "  --help         Show this help message\n";
       return 0;
     }
   }
 
-  if (!listen_enabled) {
-    std::cerr << "Error: --listen option is required for threaded mode"
+  if (!listen_enabled && !send_enabled_mode) {
+    std::cerr << "Error: Either --listen or --send option is required"
               << std::endl;
     std::cerr << "Use --help to see usage options" << std::endl;
     return -1;
   }
 
-  std::cout << "Starting threaded video streaming server..." << std::endl;
+  if (send_enabled_mode && (send_to_server.empty() || send_to_port == 0)) {
+    std::cerr << "Error: --send mode requires both --server and --port options"
+              << std::endl;
+    std::cerr << "Use --help to see usage options" << std::endl;
+    return -1;
+  }
 
-  // Start listening thread
-  listen_thread =
-      make_unique_helper<std::thread>(listenThreadFunction, listen_address);
+  if (send_enabled_mode) {
+    std::cout << "Starting direct video streaming to " << send_to_server << ":"
+              << send_to_port << "..." << std::endl;
 
-  // Main thread waits for termination signal
-  std::cout << "Server started. Press Ctrl+C to stop." << std::endl;
+    // Set up default camera configuration for direct streaming
+    {
+      std::lock_guard<std::mutex> lock(config_mutex);
+      current_camera_config.width = 2560;
+      current_camera_config.height = 720;
+      current_camera_config.fps = 60;
+      current_camera_config.bitrate = 4000000;
+      current_camera_config.enableMvHevc = 0;
+      current_camera_config.renderMode = 0;
+      current_camera_config.camera = "ZED";
+      current_camera_config.ip = send_to_server;
+      current_camera_config.port = send_to_port;
+    }
 
-  while (!stop_requested.load()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // Start streaming directly
+    startStreamingThread();
+
+    // Main thread waits for termination signal
+    std::cout << "Streaming started. Press Ctrl+C to stop." << std::endl;
+
+    while (!stop_requested.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  } else if (listen_enabled) {
+    std::cout << "Starting threaded video streaming server..." << std::endl;
+
+    // Start listening thread
+    listen_thread =
+        make_unique_helper<std::thread>(listenThreadFunction, listen_address);
+
+    // Main thread waits for termination signal
+    std::cout << "Server started. Press Ctrl+C to stop." << std::endl;
+
+    while (!stop_requested.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // Stop listening thread
+    if (listen_thread && listen_thread->joinable()) {
+      listen_thread->join();
+    }
   }
 
   std::cout << "Shutting down..." << std::endl;
 
   // Stop streaming thread first
   stopStreamingThread();
-
-  // Stop listening thread
-  if (listen_thread && listen_thread->joinable()) {
-    listen_thread->join();
-  }
 
   std::cout << "All threads stopped. Exiting." << std::endl;
   return 0;
