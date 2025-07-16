@@ -16,11 +16,14 @@ Video Previewer/Encoder/Sender on Nvidia Jetson Orin Platform
 - Build
 ```
 # Update `Makefile` to choose the protocol [TCP/UDP], camera type [Webcam/ZED], w/ or w/o ASIO.
-# Default: TCP - Webcam - w/o ASIO.
+# Default: TCP w/o asio.
 
 make
 
-OrinVideoSender --help
+./OrinVideoSender --help
+
+# Listen to coming command from VR, 192.168.1.153 is the Orin IP address
+./OrinVideoSender --listen 192.168.1.153:13579
 ```
 
 ## One More Thing 
