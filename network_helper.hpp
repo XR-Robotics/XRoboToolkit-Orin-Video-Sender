@@ -36,7 +36,7 @@ public:
     client_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (client_socket < 0) {
       throw TCPException("Socket creation failed: " +
-                              std::string(strerror(errno)));
+                         std::string(strerror(errno)));
     }
 
     sockaddr_in server_addr{};
@@ -54,8 +54,7 @@ public:
       int error = errno;
       close(client_socket);
       client_socket = -1;
-      throw TCPException("Connection failed: " +
-                              std::string(strerror(error)));
+      throw TCPException("Connection failed: " + std::string(strerror(error)));
     }
 
     connected = true;
@@ -92,7 +91,7 @@ public:
         if (error == ECONNRESET || error == EPIPE) {
           connected = false;
           throw TCPException("Connection lost: " +
-                                  std::string(strerror(error)));
+                             std::string(strerror(error)));
         }
         throw TCPException("Send failed: " + std::string(strerror(error)));
       }
@@ -142,9 +141,9 @@ private:
 
   void handleClient() {
     std::cout << "Handling client communication..." << std::endl;
-    char buffer[1024];
+    std::vector<uint8_t> buffer(1024);
     while (client_connected) {
-      ssize_t received = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
+      ssize_t received = recv(client_socket, buffer.data(), buffer.size(), 0);
       if (received < 0) {
         int error = errno;
         if (error == ECONNRESET || error == EPIPE) {
@@ -161,11 +160,12 @@ private:
         break;
       }
 
-      buffer[received] = '\0';
-      std::string s = std::string(buffer);
-      if (received > 0 && !s.empty() && data_callback) {
-        std::cout << "Received from client: " << s << std::endl;
-        data_callback(s);
+      if (received > 0 && data_callback) {
+        std::vector<uint8_t> data(buffer.begin(), buffer.begin() + received);
+        std::string binary_data(data.begin(), data.end());
+        std::cout << "Received " << received << " bytes from client"
+                  << std::endl;
+        data_callback(binary_data);
       }
     }
   }
@@ -201,7 +201,7 @@ public:
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket < 0) {
       throw TCPException("Socket creation failed: " +
-                              std::string(strerror(errno)));
+                         std::string(strerror(errno)));
     }
 
     // Enable address reuse
@@ -211,7 +211,7 @@ public:
       close(server_socket);
       server_socket = -1;
       throw TCPException("setsockopt(SO_REUSEADDR) failed: " +
-                              std::string(strerror(errno)));
+                         std::string(strerror(errno)));
     }
 
     sockaddr_in server_addr{};
@@ -237,29 +237,24 @@ public:
     std::cout << "Server listening on port " << server_port << std::endl;
   }
 
-  bool hasClient()
-  {
-    return client_socket != -1;
-  }
+  bool hasClient() { return client_socket != -1; }
 
-  void TestLoopLatency()
-  {
-      if (client_socket != -1)
-      {
-          std::string msg = "LOOPTEST";
-          size_t size = msg.size();
+  void TestLoopLatency() {
+    if (client_socket != -1) {
+      std::string msg = "LOOPTEST";
+      size_t size = msg.size();
 
-          std::vector<uint8_t> packet(4 + size);
-          packet[0] = (size >> 24) & 0xFF;
-          packet[1] = (size >> 16) & 0xFF;
-          packet[2] = (size >> 8) & 0xFF;
-          packet[3] = (size) & 0xFF;
-          std::copy(msg.begin(), msg.end(), packet.begin() + 4);
+      std::vector<uint8_t> packet(4 + size);
+      packet[0] = (size >> 24) & 0xFF;
+      packet[1] = (size >> 16) & 0xFF;
+      packet[2] = (size >> 8) & 0xFF;
+      packet[3] = (size)&0xFF;
+      std::copy(msg.begin(), msg.end(), packet.begin() + 4);
 
-          send(client_socket, packet.data(), packet.size(), 0);
+      send(client_socket, packet.data(), packet.size(), 0);
 
-          std::cout << "[TCPServer] Sent loop test msg to client." << std::endl;
-      }
+      std::cout << "[TCPServer] Sent loop test msg to client." << std::endl;
+    }
   }
 
   void stop() {
@@ -289,12 +284,13 @@ public:
 
   ~TCPServer() { stop(); }
 
-  void inline printTimeMs(std::string tag)
-  {
-      auto now = std::chrono::system_clock::now();
-      // point the current time in milliseconds
-      auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-      printf("===LATENCY TEST===[%s]\t%lld ms\n", tag.c_str(),now_ms);
+  void inline printTimeMs(std::string tag) {
+    auto now = std::chrono::system_clock::now();
+    // point the current time in milliseconds
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      now.time_since_epoch())
+                      .count();
+    printf("===LATENCY TEST===[%s]\t%lld ms\n", tag.c_str(), now_ms);
   }
 
   bool acceptConnection() {
@@ -314,12 +310,12 @@ public:
     std::cout << "Client connected from IP: " << inet_ntoa(client_addr.sin_addr)
               << ", Port: " << ntohs(client_addr.sin_port) << std::endl;
 
-    // loop test
-    // Sleep for 1 second
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    printTimeMs("Loop Send");
-    TestLoopLatency();
-    
+    // // loop test
+    // // Sleep for 1 second
+    // std::this_thread::sleep_for(std::chrono::seconds(1));
+    // printTimeMs("Loop Send");
+    // TestLoopLatency();
+
     return true;
   }
 
