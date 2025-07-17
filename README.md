@@ -23,6 +23,9 @@ Video Previewer/Encoder/Sender on Nvidia Jetson Orin Platform
 # Update `Makefile` to choose the protocol [TCP/UDP], camera type [Webcam/ZED], w/ or w/o ASIO.
 # Default: TCP w/o asio.
 
+# install zmq
+sudo apt-get install libzmq3-dev
+
 make
 
 ./OrinVideoSender --help
@@ -30,6 +33,9 @@ make
 # Listen to coming command from VR, 192.168.1.153 is the Orin IP address
 # Add `--preview` to show the video on Orin if necessary 
 ./OrinVideoSender --listen 192.168.1.153:13579
+
+# send the video stream to both VR via TCP and my own ubuntu via ZMQ
+./OrinVideoSender --listen 192.168.1.153:13579 --zmq tcp://*:5555
 
 # Direct send the video stream # 192.168.1.176 is the VR headset IP
 # Add `--preview` to show the video on Orin if necessary 
