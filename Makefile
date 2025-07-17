@@ -21,17 +21,17 @@ APP := OrinVideoSender
 ###############################################################################
 # ZED
 
-# # TCP w/o asio -- pass
-# SRCS := \
-# 	main_zed_tcp.cpp
+# TCP w/o asio -- pass
+SRCS := \
+	main_zed_tcp.cpp
 
 # # TCP with asio -- pass
 # SRCS := \
 # 	main_zed_asio.cpp
 
-# UDP w/ asio -- pass
-SRCS:= \
-	main_zed_asio_udp.cpp
+# # UDP w/ asio -- pass
+# SRCS:= \
+# 	main_zed_asio_udp.cpp
 
 # # [NOT WORKING] Zero Copy - depends on jetson multimedia api
 # SRCS := \
