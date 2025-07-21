@@ -23,9 +23,9 @@ APP := OrinVideoSender
 
 # TCP w/o asio -- pass
 SRCS := \
-# 	main_zed_tcp.cpp
+ 	main_zed_tcp.cpp
 
-SRCS := \
+#SRCS := \
 	main_zed_tcp_zmq.cpp
 
 # # TCP with asio -- pass
