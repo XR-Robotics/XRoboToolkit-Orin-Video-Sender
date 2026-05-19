@@ -8,7 +8,15 @@
 
 # Compiler settings
 CXX = g++
-APP := OrinVideoSender
+PKG_CONFIG ?= pkg-config
+APP := orinvideosender2
+DEB_DEPS := build-essential pkg-config \
+	libssl-dev libzmq3-dev libopencv-dev libglib2.0-dev \
+	libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+	gstreamer1.0-tools gstreamer1.0-plugins-base \
+	gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+	libavcodec-dev libavformat-dev libavutil-dev \
+	libswscale-dev libavdevice-dev
 
 ###############################################################################
 # WebCam
@@ -21,12 +29,17 @@ APP := OrinVideoSender
 ###############################################################################
 # ZED
 
-# TCP w/o asio -- pass
+# TCP w/o asio + ZMQ raw/encoded publisher -- G1 Orin NX low-latency build
 SRCS := \
- 	main_zed_tcp.cpp
+	main_zed_tcp_zmq_zero_copy.cpp
 
-#SRCS := \
-	main_zed_tcp_zmq.cpp
+# Original ZMQ-capable sender fallback
+# SRCS := \
+# 	main_zed_tcp_zmq.cpp
+
+# TCP w/o asio, no ZMQ fallback
+# SRCS := \
+# 	main_zed_tcp.cpp
 
 # # TCP with asio -- pass
 # SRCS := \
@@ -49,14 +62,16 @@ CPPFLAGS := -std=c++11 \
 	-I/usr/local/zed/include \
 	-I/usr/include/opencv4 \
 	-I/usr/local/cuda/include \
-	$(shell pkg-config --cflags gstreamer-1.0 gstreamer-app-1.0 glib-2.0 2>/dev/null || echo "") \
-	$(shell pkg-config --cflags libzmq 2>/dev/null || echo "")
+	$(shell $(PKG_CONFIG) --cflags gstreamer-1.0 2>/dev/null) \
+	$(shell $(PKG_CONFIG) --cflags gstreamer-app-1.0 2>/dev/null) \
+	$(shell $(PKG_CONFIG) --cflags glib-2.0 2>/dev/null) \
+	$(shell $(PKG_CONFIG) --cflags libzmq 2>/dev/null)
 
 # Compiler flags
 CXXFLAGS := -Wall -Wextra -O2 -g
 
 # FFmpeg flags
-CXXFLAGS += $(shell pkg-config --cflags libavcodec libavformat libavutil libswscale libavdevice 2>/dev/null || echo "")
+CXXFLAGS += $(shell $(PKG_CONFIG) --cflags libavcodec libavformat libavutil libswscale libavdevice 2>/dev/null)
 
 # Library paths and libraries
 LDFLAGS := -L/usr/local/zed/lib \
@@ -64,7 +79,7 @@ LDFLAGS := -L/usr/local/zed/lib \
 	# -L/usr/lib/aarch64-linux-gnu
 
 # FFmpeg libraries (must come first to avoid conflicts)
-LDFLAGS += $(shell pkg-config --libs libavcodec libavformat libavutil libswscale libavdevice 2>/dev/null || echo "-lavcodec -lavformat -lavutil -lswscale -lavdevice")
+LDFLAGS += $(shell $(PKG_CONFIG) --libs libavcodec libavformat libavutil libswscale libavdevice 2>/dev/null || echo "-lavcodec -lavformat -lavutil -lswscale -lavdevice")
 
 # Core libraries
 LDFLAGS += -lsl_zed \
@@ -75,10 +90,12 @@ LDFLAGS += -lsl_zed \
 	-lstdc++
 
 # GStreamer libraries
-LDFLAGS += $(shell pkg-config --libs gstreamer-1.0 gstreamer-app-1.0 glib-2.0 2>/dev/null || echo "-lgstreamer-1.0 -lgstapp-1.0 -lglib-2.0")
+LDFLAGS += $(shell $(PKG_CONFIG) --libs gstreamer-1.0 2>/dev/null || echo "-lgstreamer-1.0") \
+	$(shell $(PKG_CONFIG) --libs gstreamer-app-1.0 2>/dev/null || echo "-lgstapp-1.0") \
+	$(shell $(PKG_CONFIG) --libs glib-2.0 2>/dev/null || echo "-lglib-2.0")
 
 # ZMQ library
-LDFLAGS += $(shell pkg-config --libs libzmq 2>/dev/null || echo "-lzmq")
+LDFLAGS += $(shell $(PKG_CONFIG) --libs libzmq 2>/dev/null || echo "-lzmq")
 
 all: $(APP)
 
@@ -100,4 +117,17 @@ install: $(APP)
 	@echo "Installing $(APP)..."
 	install -D $(APP) /usr/local/bin/$(APP)
 
-.PHONY: all debug clean install
+install-deps:
+	sudo apt update
+	sudo apt install -y $(DEB_DEPS)
+
+check-jetson-deps:
+	@$(PKG_CONFIG) --exists gstreamer-1.0 gstreamer-app-1.0 glib-2.0 libzmq opencv4
+	@gst-inspect-1.0 nvvidconv | grep -q '^Factory Details'
+	@gst-inspect-1.0 nvv4l2h264enc | grep -q '^Factory Details'
+	@gst-inspect-1.0 h264parse | grep -q '^Factory Details'
+	@test -d /usr/local/zed/include
+	@test -d /usr/local/cuda/include
+	@echo "JetPack/ZED build dependencies look available."
+
+.PHONY: all debug clean install install-deps check-jetson-deps
