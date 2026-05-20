@@ -1,10 +1,12 @@
 // Plan A milestone 1: prove we can drive the VIC hardware directly via the
 // Jetson Multimedia API to color-convert a BGRA NvBufSurface into NV12.
 //
-// This is the same hardware path that the GStreamer `nvvidconv` element uses
-// internally, but called directly so we don't have to satisfy GStreamer's
-// caps negotiation, buffer pool, or NvBufSurface metadata rules. Once this
-// works we have the building block that previously broke main_zed_zero_copy.cpp.
+// Uses the canonical pattern from /usr/src/jetson_multimedia_api/samples/
+// 07_video_convert (which is what GStreamer's nvvidconv calls internally):
+//   - NvBufSurfaceAllocate (NOT NvBufSurfaceCreate) with NvBufSurfaceAllocateParams
+//   - dmabuf-based allocation tagged with NvBufSurfaceTag_VIDEO_CONVERT
+//   - NvBufSurfTransform with explicit src_rect AND dst_rect
+//   - Map / SyncForCpu / write / SyncForDevice / UnMap on CPU fill
 //
 // Build (on the Orin):
 //   make m1_vic_convert
@@ -13,12 +15,8 @@
 //   ./m1_vic_convert
 //
 // Verify on the laptop (or anywhere with ffplay):
-//   scp unitree@192.168.123.164:/tmp/m1_out.nv12 ~/Downloads/
+//   scp unitree@<orin>:/tmp/m1_out.nv12 ~/Downloads/
 //   ffplay -f rawvideo -pixel_format nv12 -video_size 2560x720 ~/Downloads/m1_out.nv12
-//
-// Expected: a static frame with a horizontal blue ramp + vertical green ramp +
-// solid red, indicating the VIC correctly consumed our BGRA test pattern and
-// produced a valid NV12 frame.
 
 #include <cstdint>
 #include <cstdio>
@@ -36,32 +34,32 @@ constexpr uint32_t kWidth = 2560;
 constexpr uint32_t kHeight = 720;
 const char *kOutPath = "/tmp/m1_out.nv12";
 
+// Allocate a hardware surface via NvBufSurfaceAllocate (matches the path the
+// JetPack 07_video_convert sample / NvBufSurf::NvAllocate wrapper uses).
+// Returns 0 on success and populates *out with the freshly-allocated surface.
 int allocateSurface(NvBufSurface **out, NvBufSurfaceColorFormat color,
                     const char *tag) {
-  NvBufSurfaceCreateParams params;
+  NvBufSurfaceAllocateParams params;
   std::memset(&params, 0, sizeof(params));
-  params.gpuId = 0;
-  params.width = kWidth;
-  params.height = kHeight;
-  params.size = 0;            // auto
-  params.isContiguous = true; // VIC prefers contiguous
-  params.colorFormat = color;
-  params.layout = NVBUF_LAYOUT_PITCH;
-  // SURFACE_ARRAY is the Tegra-native memory type that VIC, NVENC, and the
-  // 3D engine all consume. It is mappable to CPU via NvBufSurfaceMap (with
-  // a sync cost) but the hot path stays device-side.
-  params.memType = NVBUF_MEM_SURFACE_ARRAY;
+  params.params.width = kWidth;
+  params.params.height = kHeight;
+  params.params.colorFormat = color;
+  params.params.layout = NVBUF_LAYOUT_PITCH;
+  params.params.memType = NVBUF_MEM_SURFACE_ARRAY;
+  params.memtag = NvBufSurfaceTag_VIDEO_CONVERT;
 
-  int ret = NvBufSurfaceCreate(out, 1, &params);
+  int ret = NvBufSurfaceAllocate(out, 1, &params);
   if (ret != 0 || *out == nullptr) {
-    std::cerr << "[" << tag << "] NvBufSurfaceCreate failed (" << ret << ")"
+    std::cerr << "[" << tag << "] NvBufSurfaceAllocate failed (" << ret << ")"
               << std::endl;
     return -1;
   }
+  (*out)->numFilled = 1;  // mirror the wrapper's behavior
 
   NvBufSurfaceParams &surf = (*out)->surfaceList[0];
   std::cout << "[" << tag << "] alloc OK " << surf.width << "x" << surf.height
-            << " planes=" << surf.planeParams.num_planes;
+            << " planes=" << surf.planeParams.num_planes
+            << " fd=" << surf.bufferDesc;
   for (uint32_t pl = 0; pl < surf.planeParams.num_planes; ++pl) {
     std::cout << " p" << pl << "(" << surf.planeParams.width[pl] << "x"
               << surf.planeParams.height[pl]
@@ -72,11 +70,14 @@ int allocateSurface(NvBufSurface **out, NvBufSurfaceColorFormat color,
   return 0;
 }
 
+// Fill the BGRA source surface with a known gradient, using the JetPack-
+// recommended sync sequence: Map(READ_WRITE) -> SyncForCpu -> write -> SyncForDevice -> UnMap.
 int fillBgraGradient(NvBufSurface *surf) {
-  if (NvBufSurfaceMap(surf, 0, 0, NVBUF_MAP_WRITE) != 0) {
-    std::cerr << "NvBufSurfaceMap(BGRA, plane=0, WRITE) failed" << std::endl;
+  if (NvBufSurfaceMap(surf, 0, 0, NVBUF_MAP_READ_WRITE) != 0) {
+    std::cerr << "NvBufSurfaceMap(BGRA, plane=0, READ_WRITE) failed" << std::endl;
     return -1;
   }
+  NvBufSurfaceSyncForCpu(surf, 0, 0);
 
   NvBufSurfaceParams &p = surf->surfaceList[0];
   uint8_t *base = static_cast<uint8_t *>(p.mappedAddr.addr[0]);
@@ -93,8 +94,7 @@ int fillBgraGradient(NvBufSurface *surf) {
     uint8_t *row = base + static_cast<size_t>(y) * pitch;
     for (uint32_t x = 0; x < w; ++x) {
       uint8_t *px = row + x * 4;
-      // BGRA / BGRx: B = horizontal ramp, G = vertical ramp, R = solid 255,
-      // alpha/padding = 0.
+      // BGRA: B = horizontal ramp, G = vertical ramp, R = 255, A = 0.
       px[0] = static_cast<uint8_t>(x * 255 / w);
       px[1] = static_cast<uint8_t>(y * 255 / h);
       px[2] = 255;
@@ -108,8 +108,9 @@ int fillBgraGradient(NvBufSurface *surf) {
 }
 
 int dumpPlanesToFile(NvBufSurface *surf, const char *path) {
-  if (NvBufSurfaceMap(surf, 0, -1 /* all planes */, NVBUF_MAP_READ) != 0) {
-    std::cerr << "NvBufSurfaceMap(NV12, all planes, READ) failed" << std::endl;
+  if (NvBufSurfaceMap(surf, 0, -1 /* all planes */, NVBUF_MAP_READ_WRITE) != 0) {
+    std::cerr << "NvBufSurfaceMap(NV12, all planes, READ_WRITE) failed"
+              << std::endl;
     return -1;
   }
   NvBufSurfaceSyncForCpu(surf, 0, -1);
@@ -165,10 +166,29 @@ int main() {
     return 1;
   }
 
+  // Set up src_rect / dst_rect even though we're not cropping or scaling.
+  // The wrapper class always populates these and VIC expects them.
+  NvBufSurfTransformRect src_rect;
+  NvBufSurfTransformRect dst_rect;
+  std::memset(&src_rect, 0, sizeof(src_rect));
+  std::memset(&dst_rect, 0, sizeof(dst_rect));
+  src_rect.top = 0;
+  src_rect.left = 0;
+  src_rect.width = kWidth;
+  src_rect.height = kHeight;
+  dst_rect.top = 0;
+  dst_rect.left = 0;
+  dst_rect.width = kWidth;
+  dst_rect.height = kHeight;
+
   NvBufSurfTransformParams tparams;
   std::memset(&tparams, 0, sizeof(tparams));
-  tparams.transform_flag = NVBUFSURF_TRANSFORM_FILTER;
+  tparams.transform_flag = static_cast<NvBufSurfTransform_Transform_Flag>(
+      NVBUFSURF_TRANSFORM_FILTER | NVBUFSURF_TRANSFORM_FLIP);
+  tparams.transform_flip = NvBufSurfTransform_None;
   tparams.transform_filter = NvBufSurfTransformInter_Nearest;
+  tparams.src_rect = &src_rect;
+  tparams.dst_rect = &dst_rect;
 
   NvBufSurfTransform_Error err = NvBufSurfTransform(bgra, nv12, &tparams);
   if (err != NvBufSurfTransformError_Success) {
