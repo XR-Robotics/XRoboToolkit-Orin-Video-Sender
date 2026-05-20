@@ -157,6 +157,7 @@ int idr_interval = 15;
 int stats_interval = 120;
 int bitrate_override = 0;             // 0 = use what PICO requests
 bool cpu_retrieve = false;            // true => legacy CPU retrieve + host memcpy
+bool gpu_transform = false;           // true => CUDA SM color convert instead of VIC
 std::string dump_h264_path;           // empty => no dump
 std::ofstream dump_h264_stream;
 std::mutex dump_h264_mutex;
@@ -185,7 +186,13 @@ struct Stats {
   double grab_ms = 0, retrieve_ms = 0, bgra_copy_ms = 0, vic_ms = 0,
          enc_push_ms = 0, tcp_send_ms = 0;
   SteadyClock::time_point last_log = SteadyClock::now();
+  // Snapshots at the previous log so each line shows windowed averages over
+  // the most recent <stats_interval> frames rather than running cumulatives.
   uint64_t grabbed_at_last_log = 0;
+  uint64_t tcp_sent_at_last_log = 0;
+  double grab_ms_at_last_log = 0, retrieve_ms_at_last_log = 0,
+         bgra_copy_ms_at_last_log = 0, vic_ms_at_last_log = 0,
+         enc_push_ms_at_last_log = 0, tcp_send_ms_at_last_log = 0;
 };
 std::mutex stats_mutex;
 Stats stats;
@@ -228,13 +235,31 @@ void maybeLogStats() {
   double dt = std::chrono::duration_cast<std::chrono::duration<double>>(
                   now - stats.last_log)
                   .count();
-  double fps = dt > 0 ? (stats.grabbed - stats.grabbed_at_last_log) / dt : 0.0;
-  double g_avg = stats.grabbed ? stats.grab_ms / stats.grabbed : 0;
-  double r_avg = stats.grabbed ? stats.retrieve_ms / stats.grabbed : 0;
-  double c_avg = stats.grabbed ? stats.bgra_copy_ms / stats.grabbed : 0;
-  double v_avg = stats.grabbed ? stats.vic_ms / stats.grabbed : 0;
-  double p_avg = stats.grabbed ? stats.enc_push_ms / stats.grabbed : 0;
-  double t_avg = stats.tcp_sent ? stats.tcp_send_ms / stats.tcp_sent : 0;
+  uint64_t frames_window = stats.grabbed - stats.grabbed_at_last_log;
+  uint64_t sent_window = stats.tcp_sent - stats.tcp_sent_at_last_log;
+  double fps = dt > 0 ? frames_window / dt : 0.0;
+  double g_avg = frames_window
+                     ? (stats.grab_ms - stats.grab_ms_at_last_log) / frames_window
+                     : 0;
+  double r_avg = frames_window
+                     ? (stats.retrieve_ms - stats.retrieve_ms_at_last_log) /
+                           frames_window
+                     : 0;
+  double c_avg = frames_window
+                     ? (stats.bgra_copy_ms - stats.bgra_copy_ms_at_last_log) /
+                           frames_window
+                     : 0;
+  double v_avg = frames_window
+                     ? (stats.vic_ms - stats.vic_ms_at_last_log) / frames_window
+                     : 0;
+  double p_avg = frames_window
+                     ? (stats.enc_push_ms - stats.enc_push_ms_at_last_log) /
+                           frames_window
+                     : 0;
+  double t_avg = sent_window
+                     ? (stats.tcp_send_ms - stats.tcp_send_ms_at_last_log) /
+                           sent_window
+                     : 0;
 
   std::cout.setf(std::ios::fixed);
   std::cout.precision(2);
@@ -250,6 +275,13 @@ void maybeLogStats() {
             << " tcp_sent=" << stats.tcp_sent << std::endl;
   stats.last_log = now;
   stats.grabbed_at_last_log = stats.grabbed;
+  stats.tcp_sent_at_last_log = stats.tcp_sent;
+  stats.grab_ms_at_last_log = stats.grab_ms;
+  stats.retrieve_ms_at_last_log = stats.retrieve_ms;
+  stats.bgra_copy_ms_at_last_log = stats.bgra_copy_ms;
+  stats.vic_ms_at_last_log = stats.vic_ms;
+  stats.enc_push_ms_at_last_log = stats.enc_push_ms;
+  stats.tcp_send_ms_at_last_log = stats.tcp_send_ms;
 }
 
 // ---------------------------------------------------------------------------
@@ -598,17 +630,77 @@ void streamingThreadFunction() {
                               : "GPU retrieve + cudaMemcpy2DAsync via EGL/CUDA")
             << std::endl;
 
-  // VIC transform params (full-frame, no crop).
+  // VIC transform params (full-frame, no crop, no flip, no filter).
+  // transform_flag=0 -> VIC does the base format conversion only; the optional
+  // transform_filter/transform_flip fields are not honored.
   NvBufSurfTransformRect src_rect = {0, 0, width, height};
   NvBufSurfTransformRect dst_rect = {0, 0, width, height};
   NvBufSurfTransformParams tparams;
   std::memset(&tparams, 0, sizeof(tparams));
-  tparams.transform_flag = static_cast<NvBufSurfTransform_Transform_Flag>(
-      NVBUFSURF_TRANSFORM_FILTER | NVBUFSURF_TRANSFORM_FLIP);
-  tparams.transform_flip = NvBufSurfTransform_None;
-  tparams.transform_filter = NvBufSurfTransformInter_Nearest;
+  tparams.transform_flag = 0;
   tparams.src_rect = &src_rect;
   tparams.dst_rect = &dst_rect;
+
+  // Optional: route the color-convert through the GPU (CUDA SMs) instead of
+  // VIC.  On this Orin NX, VIC takes ~4.5 ms/frame for 2560x720 BGRA->NV12;
+  // GPU compute is faster (~1.4 ms) but pays a one-time CUDA-kernel JIT cost
+  // on the first call.  We pre-warm below to eat that before frames flow.
+  if (gpu_transform) {
+    NvBufSurfTransformConfigParams cfg_gpu;
+    std::memset(&cfg_gpu, 0, sizeof(cfg_gpu));
+    cfg_gpu.compute_mode = NvBufSurfTransformCompute_GPU;
+    cfg_gpu.gpu_id = 0;
+    cfg_gpu.cuda_stream = nullptr;
+    if (NvBufSurfTransformSetSessionParams(&cfg_gpu) !=
+        NvBufSurfTransformError_Success) {
+      std::cerr << "SetSessionParams(GPU) failed; falling back to VIC"
+                << std::endl;
+      gpu_transform = false;
+    }
+  }
+
+  // Pre-warm: trigger any JIT/initialization before the encoder + streaming
+  // loop are wired up.  Running NvBufSurfTransform once with the chosen
+  // compute_mode means the first real frame doesn't eat a ~25 s CUDA kernel
+  // compile (observed when GPU compute is selected cold).
+  std::cout << "Pre-warming transform (compute_mode="
+            << (gpu_transform ? "GPU" : "VIC") << ") ..." << std::flush;
+  SteadyClock::time_point pw0 = SteadyClock::now();
+  NvBufSurfTransform_Error pw_err = NvBufSurfTransform(bgra, nv12, &tparams);
+  SteadyClock::time_point pw1 = SteadyClock::now();
+  std::cout << " done in " << elapsedMs(pw0, pw1) << " ms"
+            << " status=" << pw_err << std::endl;
+  if (pw_err != NvBufSurfTransformError_Success) {
+    if (gpu_transform) {
+      std::cerr << "GPU compute pre-warm failed; falling back to VIC"
+                << std::endl;
+      NvBufSurfTransformConfigParams cfg_vic;
+      std::memset(&cfg_vic, 0, sizeof(cfg_vic));
+      cfg_vic.compute_mode = NvBufSurfTransformCompute_Default;
+      cfg_vic.gpu_id = 0;
+      cfg_vic.cuda_stream = nullptr;
+      NvBufSurfTransformSetSessionParams(&cfg_vic);
+      gpu_transform = false;
+      pw_err = NvBufSurfTransform(bgra, nv12, &tparams);
+      if (pw_err != NvBufSurfTransformError_Success) {
+        std::cerr << "VIC retry pre-warm also failed (" << pw_err
+                  << "); aborting" << std::endl;
+        teardownEglCudaBridge(bgra, &egl_bridge);
+        NvBufSurfaceDestroy(bgra);
+        NvBufSurfaceDestroy(nv12);
+        zed.close();
+        return;
+      }
+    } else {
+      std::cerr << "VIC pre-warm failed (" << pw_err << "); aborting"
+                << std::endl;
+      teardownEglCudaBridge(bgra, &egl_bridge);
+      NvBufSurfaceDestroy(bgra);
+      NvBufSurfaceDestroy(nv12);
+      zed.close();
+      return;
+    }
+  }
 
   // Set up encoder.
   enc_state.got_error.store(false);
@@ -941,6 +1033,8 @@ int main(int argc, char *argv[]) {
       dump_h264_path = argv[++i];
     } else if (a == "--cpu-retrieve") {
       cpu_retrieve = true;
+    } else if (a == "--gpu-transform") {
+      gpu_transform = true;
     } else if (a == "--help") {
       std::cout
           << "Usage: " << argv[0] << " [options]\n"
@@ -951,6 +1045,7 @@ int main(int argc, char *argv[]) {
           << "  --bitrate BPS         Override H.264 bitrate (default: from PICO)\n"
           << "  --dump-h264 PATH      Also write the H.264 byte stream to PATH for debugging\n"
           << "  --cpu-retrieve        Use CPU retrieve + host memcpy (default: GPU retrieve via EGL/CUDA)\n"
+          << "  --gpu-transform       Use CUDA SM color convert instead of VIC (pre-warmed; may bypass ~3ms/frame)\n"
           << "  --help                This text\n"
           << "\n"
           << "Wire-protocol compatible with orinvideosender2; internal encode is\n"
