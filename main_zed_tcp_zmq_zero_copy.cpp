@@ -15,6 +15,9 @@
 #include <map>
 #include <mutex>
 #include <opencv2/opencv.hpp>
+// Phase 2 (WBC relay) — disabled. Re-enable by flipping the #if 0 blocks
+// (search for "Phase 2 (WBC relay)") and re-adding this include for base64.
+// #include <openssl/evp.h>
 #include <openssl/md5.h>
 #include <sstream>
 #include <sl/Camera.hpp>
@@ -207,13 +210,11 @@ std::atomic<bool> encoding_enabled{false};
 std::atomic<bool> send_enabled{false};
 std::atomic<bool> preview_enabled{false};
 std::atomic<bool> zmq_enabled{false};
-std::atomic<bool> zmq_raw_mode{false};  // 发送原始图像而不是H.264
 
 // Runtime options. Defaults target the G1 Orin NX + PICO path.
 std::string zed_view_mode = "sbs";     // "sbs" or "left"
 std::string codec_override = "auto";   // "auto", "h264", or "h265"
 std::atomic<bool> low_latency_mode{true};
-std::atomic<bool> legacy_pipeline_mode{false};
 std::atomic<bool> measure_encoder_latency{false};
 int idr_interval = 15;
 int stats_interval = 120;
@@ -237,6 +238,31 @@ void* zmq_publisher = nullptr;
 std::string zmq_endpoint = "";
 std::mutex zmq_mutex;
 
+#if 0  // Phase 2 (WBC relay) — disabled
+// WBC relay (in-process replacement for orin_zed_relay.py).
+// Publishes msgpack {"timestamps":{"ego_view":t}, "images":{"ego_view":base64(jpeg)}}
+// on a separate ZMQ_PUB socket. Default mirrors the Python relay (left half of
+// SBS, 640x480 RGB, JPEG Q80).
+void *wbc_zmq_publisher = nullptr;
+std::string wbc_zmq_endpoint = "";
+int wbc_width = 640;
+int wbc_height = 480;
+int wbc_jpeg_quality = 80;
+std::atomic<bool> wbc_enabled{false};
+std::mutex wbc_zmq_mutex;
+
+// Latest-frame slot for the WBC worker. The streaming loop writes the most
+// recent BGRA frame here; the worker consumes whatever is current and drops
+// any older frame, matching the CONFLATE behavior the Python relay relied on.
+std::mutex wbc_frame_mutex;
+std::condition_variable wbc_frame_cv;
+cv::Mat wbc_frame_latest;     // BGRA, source (SBS) resolution
+uint64_t wbc_frame_seq = 0;   // monotonically increasing frame id
+uint64_t wbc_frame_consumed = 0;
+std::atomic<bool> wbc_worker_running{false};
+std::unique_ptr<std::thread> wbc_worker_thread;
+#endif  // Phase 2 (WBC relay)
+
 using SteadyClock = std::chrono::steady_clock;
 
 struct StreamStats {
@@ -245,16 +271,22 @@ struct StreamStats {
   uint64_t appsrc_pushed = 0;
   uint64_t encoded = 0;
   uint64_t tcp_sent = 0;
-  uint64_t raw_zmq_sent = 0;
-  uint64_t raw_zmq_dropped = 0;
   uint64_t encoded_zmq_sent = 0;
   uint64_t encoded_zmq_dropped = 0;
+#if 0  // Phase 2 (WBC relay) — disabled
+  uint64_t wbc_sent = 0;
+  uint64_t wbc_dropped = 0;
+  uint64_t wbc_input_overruns = 0;
+#endif
   double grab_ms = 0.0;
   double retrieve_ms = 0.0;
   double appsrc_ms = 0.0;
   double encode_ms = 0.0;
   double tcp_send_ms = 0.0;
-  double raw_zmq_ms = 0.0;
+#if 0  // Phase 2 (WBC relay) — disabled
+  double wbc_total_ms = 0.0;
+  double wbc_jpeg_ms = 0.0;
+#endif
   SteadyClock::time_point start = SteadyClock::now();
   SteadyClock::time_point last_log = SteadyClock::now();
   uint64_t grabbed_at_last_log = 0;
@@ -409,16 +441,6 @@ void recordRetrieveTiming(double ms) {
   stream_stats.retrieve_ms += ms;
 }
 
-void recordRawZmqTiming(double ms, bool sent) {
-  std::lock_guard<std::mutex> lock(stats_mutex);
-  if (sent) {
-    stream_stats.raw_zmq_sent++;
-    stream_stats.raw_zmq_ms += ms;
-  } else {
-    stream_stats.raw_zmq_dropped++;
-  }
-}
-
 void recordAppsrcTiming(uint64_t frame_id, double ms) {
   std::lock_guard<std::mutex> lock(stats_mutex);
   stream_stats.appsrc_pushed++;
@@ -456,6 +478,24 @@ void recordEncodedZmqResult(bool sent) {
   }
 }
 
+#if 0  // Phase 2 (WBC relay) — disabled
+void recordWbcResult(double total_ms, double jpeg_ms, bool sent) {
+  std::lock_guard<std::mutex> lock(stats_mutex);
+  if (sent) {
+    stream_stats.wbc_sent++;
+    stream_stats.wbc_total_ms += total_ms;
+    stream_stats.wbc_jpeg_ms += jpeg_ms;
+  } else {
+    stream_stats.wbc_dropped++;
+  }
+}
+
+void recordWbcInputOverrun() {
+  std::lock_guard<std::mutex> lock(stats_mutex);
+  stream_stats.wbc_input_overruns++;
+}
+#endif  // Phase 2 (WBC relay)
+
 void maybeLogStreamStats() {
   std::lock_guard<std::mutex> lock(stats_mutex);
   if (stats_interval <= 0 || stream_stats.grabbed == 0 ||
@@ -483,8 +523,6 @@ void maybeLogStreamStats() {
       stream_stats.encoded ? stream_stats.encode_ms / stream_stats.encoded : 0.0;
   double tcp_avg =
       stream_stats.tcp_sent ? stream_stats.tcp_send_ms / stream_stats.tcp_sent : 0.0;
-  double raw_zmq_avg =
-      stream_stats.raw_zmq_sent ? stream_stats.raw_zmq_ms / stream_stats.raw_zmq_sent : 0.0;
 
   std::cout << std::fixed << std::setprecision(2)
             << "[stats] fps=" << fps
@@ -494,11 +532,8 @@ void maybeLogStreamStats() {
             << " appsrc=" << appsrc_avg << "ms"
             << " encode=" << encode_avg << "ms"
             << " tcp_send=" << tcp_avg << "ms"
-            << " raw_zmq=" << raw_zmq_avg << "ms"
             << " encoded=" << stream_stats.encoded
             << " tcp_sent=" << stream_stats.tcp_sent
-            << " raw_zmq_sent=" << stream_stats.raw_zmq_sent
-            << " raw_zmq_drop=" << stream_stats.raw_zmq_dropped
             << " enc_zmq_sent=" << stream_stats.encoded_zmq_sent
             << " enc_zmq_drop=" << stream_stats.encoded_zmq_dropped
             << std::endl;
@@ -596,6 +631,306 @@ void configureParser(GstElement *parser) {
   }
   setIntPropertyIfPresent(parser, "config-interval", -1);
 }
+
+// ---------------------------------------------------------------------------
+// WBC relay helpers (in-process replacement for orin_zed_relay.py)
+// ---------------------------------------------------------------------------
+#if 0  // Phase 2 (WBC relay) — disabled
+
+bool initialize_wbc_zmq() {
+  if (wbc_zmq_endpoint.empty()) {
+    return false;
+  }
+  if (!zmq_context) {
+    // initialize_zmq() owns the context; create one lazily if --wbc-zmq was
+    // requested without --zmq.
+    zmq_context = zmq_ctx_new();
+    if (!zmq_context) {
+      std::cerr << "Failed to create ZMQ context for WBC publisher" << std::endl;
+      return false;
+    }
+  }
+
+  std::lock_guard<std::mutex> lock(wbc_zmq_mutex);
+  wbc_zmq_publisher = zmq_socket(zmq_context, ZMQ_PUB);
+  if (!wbc_zmq_publisher) {
+    std::cerr << "Failed to create WBC ZMQ publisher socket" << std::endl;
+    return false;
+  }
+
+  int hwm = 5;  // Matches orin_zed_relay.py SNDHWM.
+  zmq_setsockopt(wbc_zmq_publisher, ZMQ_SNDHWM, &hwm, sizeof(hwm));
+  int linger = 0;
+  zmq_setsockopt(wbc_zmq_publisher, ZMQ_LINGER, &linger, sizeof(linger));
+
+  if (zmq_bind(wbc_zmq_publisher, wbc_zmq_endpoint.c_str()) != 0) {
+    std::cerr << "Failed to bind WBC ZMQ publisher to " << wbc_zmq_endpoint
+              << ": " << zmq_strerror(zmq_errno()) << std::endl;
+    zmq_close(wbc_zmq_publisher);
+    wbc_zmq_publisher = nullptr;
+    return false;
+  }
+
+  std::cout << "WBC ZMQ publisher bound to " << wbc_zmq_endpoint
+            << " (target " << wbc_width << "x" << wbc_height
+            << " JPEG Q" << wbc_jpeg_quality << ")" << std::endl;
+  return true;
+}
+
+void cleanup_wbc_zmq() {
+  std::lock_guard<std::mutex> lock(wbc_zmq_mutex);
+  if (wbc_zmq_publisher) {
+    zmq_close(wbc_zmq_publisher);
+    wbc_zmq_publisher = nullptr;
+  }
+}
+
+// Push the latest BGRA frame into the WBC slot. The streaming loop must not
+// block on WBC work; if the worker has not consumed the previous frame yet we
+// simply overwrite it, matching the CONFLATE semantics of orin_zed_relay.py.
+void publishWbcFrame(const cv::Mat &bgra_sbs) {
+  if (!wbc_worker_running.load() || bgra_sbs.empty()) {
+    return;
+  }
+  bool overrun = false;
+  {
+    std::lock_guard<std::mutex> lock(wbc_frame_mutex);
+    if (wbc_frame_seq != wbc_frame_consumed) {
+      overrun = true;
+    }
+    bgra_sbs.copyTo(wbc_frame_latest);
+    wbc_frame_seq++;
+  }
+  if (overrun) {
+    recordWbcInputOverrun();
+  }
+  wbc_frame_cv.notify_one();
+}
+
+namespace {
+
+// Hand-rolled, schema-specific msgpack writer. The payload is fixed:
+//   { "timestamps": { "ego_view": <float64> },
+//     "images":     { "ego_view": <str>      } }
+// Using a focused writer avoids pulling in libmsgpack/msgpack-cxx as a new
+// build dependency.
+
+void msgpack_write_fixstr(std::vector<uint8_t> &out, const char *s) {
+  size_t len = std::strlen(s);
+  if (len > 31) {
+    throw std::invalid_argument("msgpack_write_fixstr: key too long");
+  }
+  out.push_back(static_cast<uint8_t>(0xa0 | static_cast<uint8_t>(len)));
+  out.insert(out.end(), s, s + len);
+}
+
+void msgpack_write_str(std::vector<uint8_t> &out, const uint8_t *data,
+                       size_t len) {
+  if (len <= 31) {
+    out.push_back(static_cast<uint8_t>(0xa0 | static_cast<uint8_t>(len)));
+  } else if (len <= 0xff) {
+    out.push_back(0xd9);
+    out.push_back(static_cast<uint8_t>(len));
+  } else if (len <= 0xffff) {
+    out.push_back(0xda);
+    out.push_back(static_cast<uint8_t>((len >> 8) & 0xff));
+    out.push_back(static_cast<uint8_t>(len & 0xff));
+  } else {
+    if (len > 0xffffffffull) {
+      throw std::invalid_argument("msgpack_write_str: payload too large");
+    }
+    uint32_t l = static_cast<uint32_t>(len);
+    out.push_back(0xdb);
+    out.push_back(static_cast<uint8_t>((l >> 24) & 0xff));
+    out.push_back(static_cast<uint8_t>((l >> 16) & 0xff));
+    out.push_back(static_cast<uint8_t>((l >> 8) & 0xff));
+    out.push_back(static_cast<uint8_t>(l & 0xff));
+  }
+  out.insert(out.end(), data, data + len);
+}
+
+void msgpack_write_float64(std::vector<uint8_t> &out, double value) {
+  uint64_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));  // host endianness double bit pattern
+  out.push_back(0xcb);
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    out.push_back(static_cast<uint8_t>((bits >> shift) & 0xff));
+  }
+}
+
+// Build the msgpack payload expected by ZedNetworkSensor / composed_camera.py.
+std::vector<uint8_t> buildWbcMsgpack(const std::vector<uint8_t> &b64_jpeg,
+                                     double timestamp_sec) {
+  std::vector<uint8_t> out;
+  out.reserve(64 + b64_jpeg.size());
+  out.push_back(0x82);  // fixmap (2 entries)
+
+  msgpack_write_fixstr(out, "timestamps");
+  out.push_back(0x81);  // fixmap (1 entry)
+  msgpack_write_fixstr(out, "ego_view");
+  msgpack_write_float64(out, timestamp_sec);
+
+  msgpack_write_fixstr(out, "images");
+  out.push_back(0x81);  // fixmap (1 entry)
+  msgpack_write_fixstr(out, "ego_view");
+  msgpack_write_str(out, b64_jpeg.data(), b64_jpeg.size());
+
+  return out;
+}
+
+std::vector<uint8_t> base64Encode(const uint8_t *data, size_t len) {
+  if (len == 0) {
+    return std::vector<uint8_t>();
+  }
+  size_t out_len = 4 * ((len + 2) / 3);
+  std::vector<uint8_t> out(out_len + 1, 0);  // EVP_EncodeBlock writes a NUL.
+  int written = EVP_EncodeBlock(out.data(), data, static_cast<int>(len));
+  if (written < 0) {
+    return std::vector<uint8_t>();
+  }
+  out.resize(static_cast<size_t>(written));
+  return out;
+}
+
+double monotonicWallTimeSec() {
+  // composed_camera.py / lerobot timestamps use time.time(); match it.
+  auto now = std::chrono::system_clock::now().time_since_epoch();
+  return std::chrono::duration<double>(now).count();
+}
+
+}  // namespace
+
+void wbcWorkerLoop() {
+  std::cout << "WBC worker started (publishing on " << wbc_zmq_endpoint
+            << ")" << std::endl;
+
+  cv::Mat scratch;
+  cv::Mat resized;
+  cv::Mat rgb;
+  std::vector<int> jpeg_params;
+  jpeg_params.push_back(cv::IMWRITE_JPEG_QUALITY);
+  jpeg_params.push_back(wbc_jpeg_quality);
+
+  std::vector<uint8_t> jpeg_buf;
+  uint64_t last_seq = 0;
+
+  while (wbc_worker_running.load() && !stop_requested.load()) {
+    {
+      std::unique_lock<std::mutex> lock(wbc_frame_mutex);
+      wbc_frame_cv.wait_for(lock, std::chrono::milliseconds(200), [&] {
+        return !wbc_worker_running.load() || stop_requested.load() ||
+               wbc_frame_seq != last_seq;
+      });
+      if (!wbc_worker_running.load() || stop_requested.load()) {
+        break;
+      }
+      if (wbc_frame_seq == last_seq || wbc_frame_latest.empty()) {
+        continue;
+      }
+      wbc_frame_latest.copyTo(scratch);
+      last_seq = wbc_frame_seq;
+      wbc_frame_consumed = wbc_frame_seq;
+    }
+
+    SteadyClock::time_point t0 = SteadyClock::now();
+
+    if (scratch.channels() != 4) {
+      // The current pipeline always produces BGRA. Skip anything else
+      // rather than guess at the source layout.
+      recordWbcResult(0.0, 0.0, false);
+      continue;
+    }
+
+    // SBS left half. cv::Range is half-open: [0, width/2).
+    cv::Mat left_bgra = scratch(cv::Range::all(),
+                                cv::Range(0, scratch.cols / 2));
+
+    if (left_bgra.cols != wbc_width || left_bgra.rows != wbc_height) {
+      cv::resize(left_bgra, resized, cv::Size(wbc_width, wbc_height), 0, 0,
+                 cv::INTER_AREA);
+    } else {
+      resized = left_bgra;
+    }
+
+    // BGRA -> RGB (the Python relay used img[:, :, ::-1] on the BGR slice,
+    // which is BGR->RGB; we go straight from BGRA so cv::cvtColor handles the
+    // channel order and alpha drop in one step).
+    cv::cvtColor(resized, rgb, cv::COLOR_BGRA2RGB);
+
+    SteadyClock::time_point t_jpeg_start = SteadyClock::now();
+    jpeg_buf.clear();
+    if (!cv::imencode(".jpg", rgb, jpeg_buf, jpeg_params)) {
+      recordWbcResult(0.0, 0.0, false);
+      continue;
+    }
+    double jpeg_ms = elapsedMs(t_jpeg_start, SteadyClock::now());
+
+    std::vector<uint8_t> b64 =
+        base64Encode(jpeg_buf.data(), jpeg_buf.size());
+    if (b64.empty()) {
+      recordWbcResult(0.0, jpeg_ms, false);
+      continue;
+    }
+
+    std::vector<uint8_t> packed;
+    try {
+      packed = buildWbcMsgpack(b64, monotonicWallTimeSec());
+    } catch (const std::exception &e) {
+      std::cerr << "WBC msgpack error: " << e.what() << std::endl;
+      recordWbcResult(0.0, jpeg_ms, false);
+      continue;
+    }
+
+    bool sent = false;
+    {
+      std::lock_guard<std::mutex> lock(wbc_zmq_mutex);
+      if (wbc_zmq_publisher) {
+        int rc = zmq_send(wbc_zmq_publisher, packed.data(), packed.size(),
+                          ZMQ_DONTWAIT);
+        if (rc == -1) {
+          if (zmq_errno() != EAGAIN) {
+            std::cerr << "WBC ZMQ send error: " << zmq_strerror(zmq_errno())
+                      << std::endl;
+          }
+        } else {
+          sent = true;
+        }
+      }
+    }
+
+    recordWbcResult(elapsedMs(t0, SteadyClock::now()), jpeg_ms, sent);
+  }
+
+  std::cout << "WBC worker stopped" << std::endl;
+}
+
+void startWbcWorker() {
+  if (!wbc_enabled.load() || !wbc_zmq_publisher) {
+    return;
+  }
+  if (wbc_worker_thread && wbc_worker_thread->joinable()) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(wbc_frame_mutex);
+    wbc_frame_seq = 0;
+    wbc_frame_consumed = 0;
+    wbc_frame_latest.release();
+  }
+  wbc_worker_running.store(true);
+  wbc_worker_thread = make_unique_helper<std::thread>(wbcWorkerLoop);
+}
+
+void stopWbcWorker() {
+  wbc_worker_running.store(false);
+  wbc_frame_cv.notify_all();
+  if (wbc_worker_thread && wbc_worker_thread->joinable()) {
+    wbc_worker_thread->join();
+  }
+  wbc_worker_thread = nullptr;
+}
+
+#endif  // Phase 2 (WBC relay)
 
 // Forward declarations
 void handleOpenCamera(const std::vector<uint8_t> &data);
@@ -829,10 +1164,8 @@ GstFlowReturn on_new_sample(GstAppSink *sink, gpointer user_data) {
       }
     }
 
-    // Encoded ZMQ output is used only by --zmq. --zmq-raw publishes raw frames
-    // from the capture loop, which avoids mixing H.264 packets into the raw feed.
-    if (!zmq_raw_mode.load() && zmq_enabled.load() && zmq_publisher && data &&
-        size > 0) {
+    // Encoded H.264 ZMQ output (--zmq).
+    if (zmq_enabled.load() && zmq_publisher && data && size > 0) {
       try {
         std::lock_guard<std::mutex> lock(zmq_mutex);
         
@@ -977,10 +1310,6 @@ std::string buildPipelineString(const CameraRequestData &config,
       "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
       "leaky=downstream ! ";
 
-  if (legacy_pipeline_mode.load()) {
-    pipeline_str += "videoconvert ! ";
-  }
-
   pipeline_str += "nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
                   "tee name=t ";
 
@@ -1054,10 +1383,6 @@ int main(int argc, char *argv[]) {
     } else if (arg == "--zmq" && i + 1 < argc) {
       zmq_enabled_mode = true;
       zmq_endpoint = argv[++i];
-    } else if (arg == "--zmq-raw" && i + 1 < argc) {
-      zmq_enabled_mode = true;
-      zmq_endpoint = argv[++i];
-      zmq_raw_mode.store(true);
     } else if (arg == "--view" && i + 1 < argc) {
       std::string view = toLowerCopy(argv[++i]);
       if (view == "sbs" || view == "side-by-side" || view == "side_by_side") {
@@ -1080,8 +1405,6 @@ int main(int argc, char *argv[]) {
       }
     } else if (arg == "--no-low-latency") {
       low_latency_mode.store(false);
-    } else if (arg == "--legacy-pipeline") {
-      legacy_pipeline_mode.store(true);
     } else if (arg == "--measure-encoder-latency") {
       measure_encoder_latency.store(true);
     } else if (arg == "--idr-interval" && i + 1 < argc) {
@@ -1098,11 +1421,9 @@ int main(int argc, char *argv[]) {
       std::cout << "  --server IP    Server IP address\n";
       std::cout << "  --port PORT    Server port\n";
       std::cout << "  --zmq ENDPOINT     ZMQ publish endpoint for H.264 stream (e.g. tcp://*:5555)\n";
-      std::cout << "  --zmq-raw ENDPOINT ZMQ publish endpoint for raw images (e.g. tcp://*:5556)\n";
       std::cout << "  --view MODE        ZED view: sbs (default) or left\n";
       std::cout << "  --codec MODE       Encoder: auto (default), h264, or h265\n";
       std::cout << "  --no-low-latency   Disable Jetson low-latency encoder settings\n";
-      std::cout << "  --legacy-pipeline  Use CPU videoconvert before nvvidconv fallback\n";
       std::cout << "  --idr-interval N   IDR/I-frame interval for low-latency mode (default: 15)\n";
       std::cout << "  --stats-interval N Log timing every N grabbed frames (default: 120, 0 disables)\n";
       std::cout << "  --measure-encoder-latency Enable nvv4l2 MeasureEncoderLatency if available\n";
@@ -1110,7 +1431,6 @@ int main(int argc, char *argv[]) {
       std::cout << "Examples:\n";
       std::cout << "  " << argv[0] << " --send --server 192.168.1.100 --port 8080 --zmq tcp://*:5555\n";
       std::cout << "  " << argv[0] << " --listen 0.0.0.0:9090 --zmq tcp://*:5555\n";
-      std::cout << "  " << argv[0] << " --listen 0.0.0.0:9090 --zmq-raw tcp://*:5556  # Low latency raw images\n";
       return 0;
     }
   }
@@ -1335,8 +1655,7 @@ void streamingThreadFunction() {
               << " codec=" << (pipeline_config.enableMvHevc ? "H265" : "H264")
               << " bitrate=" << pipeline_config.bitrate
               << " low_latency=" << (low_latency_mode.load() ? "on" : "off")
-              << " legacy_pipeline="
-              << (legacy_pipeline_mode.load() ? "on" : "off") << std::endl;
+              << std::endl;
 
     std::string pipeline_str =
         buildPipelineString(pipeline_config, preview_enabled.load());
@@ -1390,6 +1709,14 @@ void streamingThreadFunction() {
       zed.close();
       return;
     }
+
+#if 0  // Phase 2 (WBC relay) — disabled
+    // The WBC worker should not run before the encoder pipeline is alive,
+    // otherwise an early failure here would orphan it.
+    startWbcWorker();
+    publishWbcFrame(cv_image);
+#endif
+
     uint64_t frame_id = 0;
 
     std::cout << "Starting streaming loop..." << std::endl;
@@ -1414,44 +1741,11 @@ void streamingThreadFunction() {
           continue;
         }
 
-        // 直接通过ZMQ发送原始图像
-        if (zmq_raw_mode.load() && zmq_enabled.load() && zmq_publisher &&
-            cv_image.data && cv_image.total() > 0) {
-          try {
-            SteadyClock::time_point zmq_start = SteadyClock::now();
-            std::lock_guard<std::mutex> lock(zmq_mutex);
-            
-            // 创建消息：[4字节宽度][4字节高度][4字节通道数][图像数据]
-            size_t data_size = cv_image.total() * cv_image.elemSize();
-            std::vector<uint8_t> zmq_packet(12 + data_size);
-            
-            // 写入图像信息
-            int width = cv_image.cols;
-            int height = cv_image.rows;
-            int channels = cv_image.channels();
-            
-            std::memcpy(&zmq_packet[0], &width, 4);
-            std::memcpy(&zmq_packet[4], &height, 4);
-            std::memcpy(&zmq_packet[8], &channels, 4);
-            
-            // 写入图像数据
-            std::memcpy(&zmq_packet[12], cv_image.data, data_size);
-
-            // 通过ZMQ发送 (非阻塞)
-            int rc = zmq_send(zmq_publisher, zmq_packet.data(), zmq_packet.size(), ZMQ_DONTWAIT);
-            if (rc == -1) {
-              if (zmq_errno() != EAGAIN) {
-                std::cerr << "ZMQ send error: " << zmq_strerror(zmq_errno()) << std::endl;
-              }
-              recordRawZmqTiming(0.0, false);
-            } else {
-              recordRawZmqTiming(elapsedMs(zmq_start, SteadyClock::now()), true);
-            }
-          } catch (const std::exception &e) {
-            std::cerr << "Unexpected error in ZMQ raw image send: " << e.what() << std::endl;
-            recordRawZmqTiming(0.0, false);
-          }
-        }
+#if 0  // Phase 2 (WBC relay) — disabled
+        // Hand the latest BGRA frame to the WBC worker (latest-only). This
+        // must stay non-blocking so PICO encode latency is unaffected.
+        publishWbcFrame(cv_image);
+#endif
 
         if (encoding_enabled.load()) {
           uint64_t current_frame_id = static_cast<uint64_t>(frame_id);
@@ -1493,6 +1787,12 @@ void streamingThreadFunction() {
     }
 
     std::cout << "Streaming loop ended, cleaning up..." << std::endl;
+
+#if 0  // Phase 2 (WBC relay) — disabled
+    // Stop the WBC worker before tearing down the pipeline so its final
+    // publishWbcFrame() snapshot does not race against shutdown.
+    stopWbcWorker();
+#endif
 
     // Clean shutdown
     gst_app_src_end_of_stream(GST_APP_SRC(appsrc));

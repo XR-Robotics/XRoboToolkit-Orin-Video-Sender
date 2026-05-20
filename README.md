@@ -37,29 +37,31 @@ make
 ./orinvideosender2 --help
 
 # Listen to coming command from VR, 192.168.1.153 is the Orin IP address
-# Add `--preview` to show the video on Orin if necessary 
+# Add `--preview` to show the video on Orin if necessary
 ./orinvideosender2 --listen 192.168.1.153:13579 --codec h264
 
-# send the video stream to both VR via TCP and my own ubuntu via ZMQ
+# Send the H.264 stream to both VR via TCP and a local subscriber via ZMQ
 ./orinvideosender2 --listen 192.168.1.153:13579 --codec h264 --zmq tcp://*:5555
 
-# Current WBC-compatible fallback: PICO TCP + raw side-by-side BGRA on 5556
-./orinvideosender2 --listen 192.168.1.153:13579 --codec h264 --zmq-raw tcp://*:5556
-
 # Direct send the video stream # 192.168.1.176 is the VR headset IP
-# Add `--preview` to show the video on Orin if necessary 
+# Add `--preview` to show the video on Orin if necessary
 ./orinvideosender2 --send --server 192.168.1.176 --port 12345 --codec h264
 ```
+
+> Note: `orinvideosender2` is the opinionated low-latency build. The legacy
+> `--legacy-pipeline` (CPU `videoconvert` shim) and `--zmq-raw` (raw side-by-side
+> BGRA publisher) paths have been removed. Keep the original `OrinVideoSender`
+> binary if you still need either of those.
 
 ## G1 Orin NX low-latency notes
 
 - Default ZED view is side-by-side (`--view sbs`) for the existing PICO XRoboToolkit Unity client.
 - `--view left` is available for mono testing only; PICO stereo expects SBS unless Unity is changed.
-- The default Jetson pipeline is `BGRA appsrc -> nvvidconv -> NVMM/NV12 -> nvv4l2h264enc -> h264parse -> appsink`.
-- Current remaining copy: ZED CPU BGRA image into the `appsrc` buffer; color conversion and H.264 encode stay on Jetson hardware.
-- Use `--legacy-pipeline` only if `nvvidconv` rejects direct BGRA input on a specific JetPack image.
+- The pipeline is `BGRA appsrc -> nvvidconv -> NVMM/NV12 -> nvv4l2h264enc -> h264parse -> appsink`.
+- Remaining CPU copy: ZED CPU BGRA image into the `appsrc` buffer. Color conversion and H.264 encode stay on Jetson hardware.
 - Low-latency mode sets available encoder properties at runtime: max performance, SPS/PPS insertion, CBR, IDR/I-frame interval, and no B-frames where supported.
 - Timing logs report grab, retrieve, appsrc copy/push, encode-to-appsink, TCP send, ZMQ send, FPS, and drops every `--stats-interval` frames.
+- The earlier hand-rolled NVMM/dmabuf attempt in `main_zed_zero_copy.cpp` is kept for reference only — it broke the Jetson NVMM contract (wrong `NVBUF_MEM_*` mode, missing `NvBufSurface` meta on the `GstBuffer`) and never produced a valid encoder input. A real GPU/NVMM path would need the Jetson Multimedia API directly, or a custom GStreamer element that produces proper L4T-tagged buffers.
 
 ## One More Thing 
 
