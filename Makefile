@@ -137,8 +137,33 @@ m2_zed_vic_nv12: m2_zed_vic_nv12.cpp
 	$(CXX) -std=c++11 -O2 -g -Wall -Wextra $(M2_INCLUDES) \
 		$< -o $@ $(M2_LDFLAGS)
 
+# M3 needs ZED + CUDA + MMAPI helper classes (compiled in from the JetPack tree).
+MMAPI_CLASS_DIR := /usr/src/jetson_multimedia_api/samples/common/classes
+MMAPI_BUILD_DIR := _mmapi_build
+M3_MMAPI_SRCS := \
+	$(MMAPI_CLASS_DIR)/NvBuffer.cpp \
+	$(MMAPI_CLASS_DIR)/NvLogging.cpp \
+	$(MMAPI_CLASS_DIR)/NvElement.cpp \
+	$(MMAPI_CLASS_DIR)/NvElementProfiler.cpp \
+	$(MMAPI_CLASS_DIR)/NvV4l2Element.cpp \
+	$(MMAPI_CLASS_DIR)/NvV4l2ElementPlane.cpp \
+	$(MMAPI_CLASS_DIR)/NvVideoEncoder.cpp
+M3_MMAPI_OBJS := $(patsubst $(MMAPI_CLASS_DIR)/%.cpp,$(MMAPI_BUILD_DIR)/%.o,$(M3_MMAPI_SRCS))
+
+$(MMAPI_BUILD_DIR):
+	mkdir -p $@
+
+$(MMAPI_BUILD_DIR)/%.o: $(MMAPI_CLASS_DIR)/%.cpp | $(MMAPI_BUILD_DIR)
+	@echo "Compiling MMAPI helper: $<"
+	$(CXX) -std=c++11 -O2 -g $(M2_INCLUDES) -c $< -o $@
+
+m3_zed_vic_nvenc: m3_zed_vic_nvenc.cpp $(M3_MMAPI_OBJS)
+	@echo "Compiling+linking: $@"
+	$(CXX) -std=c++11 -O2 -g -Wall -Wextra $(M2_INCLUDES) \
+		m3_zed_vic_nvenc.cpp $(M3_MMAPI_OBJS) -o $@ $(M2_LDFLAGS) -lnvv4l2
+
 clean:
-	rm -rf $(APP) $(OBJS) m1_vic_convert m2_zed_vic_nv12
+	rm -rf $(APP) $(OBJS) m1_vic_convert m2_zed_vic_nv12 m3_zed_vic_nvenc $(MMAPI_BUILD_DIR)
 
 install: $(APP)
 	@echo "Installing $(APP)..."
