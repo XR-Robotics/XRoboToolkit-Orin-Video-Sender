@@ -110,8 +110,24 @@ $(APP): $(OBJS)
 	@echo "Linking: $@"
 	$(CXX) -o $@ $(OBJS) $(LDFLAGS)
 
+###############################################################################
+# Plan A milestone targets — Jetson Multimedia API (VIC + NVENC direct).
+# Independent of $(APP); built only when explicitly requested. These targets
+# do not pull in the ZED SDK, OpenCV, or GStreamer; they only need MMAPI.
+###############################################################################
+
+MMAPI_INCLUDES := -I/usr/src/jetson_multimedia_api/include
+MMAPI_LDFLAGS  := -L/usr/lib/aarch64-linux-gnu/tegra \
+	-Wl,-rpath,/usr/lib/aarch64-linux-gnu/tegra \
+	-lnvbufsurface -lnvbufsurftransform
+
+m1_vic_convert: m1_vic_convert.cpp
+	@echo "Compiling+linking: $@"
+	$(CXX) -std=c++11 -O2 -g -Wall -Wextra $(MMAPI_INCLUDES) \
+		$< -o $@ $(MMAPI_LDFLAGS)
+
 clean:
-	rm -rf $(APP) $(OBJS)
+	rm -rf $(APP) $(OBJS) m1_vic_convert
 
 install: $(APP)
 	@echo "Installing $(APP)..."
