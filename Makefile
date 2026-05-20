@@ -162,8 +162,15 @@ m3_zed_vic_nvenc: m3_zed_vic_nvenc.cpp $(M3_MMAPI_OBJS)
 	$(CXX) -std=c++11 -O2 -g -Wall -Wextra $(M2_INCLUDES) \
 		m3_zed_vic_nvenc.cpp $(M3_MMAPI_OBJS) -o $@ $(M2_LDFLAGS) -lnvv4l2
 
+# Plan A end product: drop-in TCP-protocol replacement for orinvideosender2.
+orinvideosender3: main_zed_mmapi.cpp $(M3_MMAPI_OBJS) network_helper.hpp
+	@echo "Compiling+linking: $@"
+	$(CXX) -std=c++11 -O2 -g -Wall -Wextra $(M2_INCLUDES) \
+		main_zed_mmapi.cpp $(M3_MMAPI_OBJS) -o $@ $(M2_LDFLAGS) -lnvv4l2
+
 clean:
-	rm -rf $(APP) $(OBJS) m1_vic_convert m2_zed_vic_nv12 m3_zed_vic_nvenc $(MMAPI_BUILD_DIR)
+	rm -rf $(APP) $(OBJS) m1_vic_convert m2_zed_vic_nv12 m3_zed_vic_nvenc \
+		orinvideosender3 $(MMAPI_BUILD_DIR)
 
 install: $(APP)
 	@echo "Installing $(APP)..."
