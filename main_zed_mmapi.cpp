@@ -9,10 +9,16 @@
 //            -> nvv4l2h264enc -> h264parse -> appsink) -> TCP
 //
 //   orinvideosender3 (Plan A):
-//     ZED -> CPU BGRA -> NvBufSurface (BGRA, NVBUF_MEM_SURFACE_ARRAY)
+//     ZED -> retrieveImage(GPU)
+//          -> EGLImage of NvBufSurface (BGRA, SURFACE_ARRAY)
+//             registered with CUDA via cuGraphicsEGLRegisterImage
+//          -> cudaMemcpy2DAsync (D2D) from sl::Mat GPU ptr -> EGL frame
 //          -> NvBufSurfTransform (VIC, BGRA -> NV12)
 //          -> NvBufSurface (NV12) -> memcpy -> NvVideoEncoder output plane
 //          -> NVENC (V4L2 M2M) -> capture plane DQ callback -> TCP send
+//
+//   --cpu-retrieve falls back to: ZED -> CPU BGRA -> host memcpy
+//                                 -> NvBufSurface (BGRA, SURFACE_ARRAY) -> ...
 //
 // Removed vs orinvideosender2: GStreamer, OpenCV, ZMQ, videoconvert. Only the
 // network protocol stays compatible.
@@ -35,8 +41,13 @@
 #include <thread>
 #include <vector>
 
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <NvBuffer.h>
 #include <NvVideoEncoder.h>
+#include <cuda.h>
+#include <cudaEGL.h>
+#include <cuda_runtime.h>
 #include <nvbufsurface.h>
 #include <nvbufsurftransform.h>
 #include <sl/Camera.hpp>
@@ -145,6 +156,7 @@ std::string zed_view_mode = "sbs";    // "sbs" or "left"
 int idr_interval = 15;
 int stats_interval = 120;
 int bitrate_override = 0;             // 0 = use what PICO requests
+bool cpu_retrieve = false;            // true => legacy CPU retrieve + host memcpy
 std::string dump_h264_path;           // empty => no dump
 std::ofstream dump_h264_stream;
 std::mutex dump_h264_mutex;
@@ -358,6 +370,96 @@ int copyBgraIntoSurface(NvBufSurface *surf, const uint8_t *src, uint32_t src_pit
   return 0;
 }
 
+// EGL/CUDA bridge: lets the GPU side write into a VIC-compatible SURFACE_ARRAY
+// NvBufSurface.  Setup creates an EGLImage for the surface (via NvBufSurface),
+// registers it with the CUDA driver, and resolves the mapped EGL frame.  The
+// resulting CUeglFrame exposes either a CUarray (block-linear) or a CUdeviceptr
+// (pitch-linear) we can target from cudaMemcpy2DAsync.
+struct EglCudaBridge {
+  bool egl_mapped = false;
+  bool cuda_registered = false;
+  CUgraphicsResource cuda_resource = nullptr;
+  CUeglFrame egl_frame{};
+};
+
+int setupEglCudaBridge(NvBufSurface *surf, EglCudaBridge *br) {
+  if (NvBufSurfaceMapEglImage(surf, 0) != 0) {
+    std::cerr << "NvBufSurfaceMapEglImage failed" << std::endl;
+    return -1;
+  }
+  br->egl_mapped = true;
+  EGLImageKHR egl_image =
+      static_cast<EGLImageKHR>(surf->surfaceList[0].mappedAddr.eglImage);
+  if (!egl_image) {
+    std::cerr << "Null EGLImageKHR after NvBufSurfaceMapEglImage" << std::endl;
+    return -1;
+  }
+  CUresult cu = cuGraphicsEGLRegisterImage(&br->cuda_resource, egl_image,
+                                            CU_GRAPHICS_REGISTER_FLAGS_NONE);
+  if (cu != CUDA_SUCCESS) {
+    std::cerr << "cuGraphicsEGLRegisterImage failed: " << cu << std::endl;
+    return -1;
+  }
+  br->cuda_registered = true;
+  cu = cuGraphicsResourceGetMappedEglFrame(&br->egl_frame, br->cuda_resource, 0,
+                                            0);
+  if (cu != CUDA_SUCCESS) {
+    std::cerr << "cuGraphicsResourceGetMappedEglFrame failed: " << cu
+              << std::endl;
+    return -1;
+  }
+  std::cout << "EGL/CUDA bridge ready: frameType="
+            << (br->egl_frame.frameType == CU_EGL_FRAME_TYPE_PITCH
+                    ? "PITCH"
+                    : "ARRAY")
+            << " pitch=" << br->egl_frame.pitch
+            << " w=" << br->egl_frame.width
+            << " h=" << br->egl_frame.height << std::endl;
+  return 0;
+}
+
+void teardownEglCudaBridge(NvBufSurface *surf, EglCudaBridge *br) {
+  if (br->cuda_registered) {
+    cuGraphicsUnregisterResource(br->cuda_resource);
+    br->cuda_registered = false;
+  }
+  if (br->egl_mapped) {
+    NvBufSurfaceUnMapEglImage(surf, 0);
+    br->egl_mapped = false;
+  }
+}
+
+// Copy a sl::Mat GPU buffer (CUDA device pointer) into the EGL-mapped
+// NvBufSurface plane via runtime-API cudaMemcpy2DAsync, then sync.  The
+// destination is whatever the EGL frame exposes (CUarray for block-linear,
+// linear device pointer for pitch-linear).
+int copyBgraGpuViaEgl(const EglCudaBridge *br, const void *src_dev,
+                       size_t src_pitch, uint32_t w, uint32_t h) {
+  const size_t row_bytes = static_cast<size_t>(w) * 4;
+  cudaError_t err = cudaSuccess;
+  if (br->egl_frame.frameType == CU_EGL_FRAME_TYPE_PITCH) {
+    err = cudaMemcpy2DAsync(br->egl_frame.frame.pPitch[0], br->egl_frame.pitch,
+                             src_dev, src_pitch, row_bytes, h,
+                             cudaMemcpyDeviceToDevice, 0);
+  } else {
+    err = cudaMemcpy2DToArrayAsync(
+        reinterpret_cast<cudaArray_t>(br->egl_frame.frame.pArray[0]), 0, 0,
+        src_dev, src_pitch, row_bytes, h, cudaMemcpyDeviceToDevice, 0);
+  }
+  if (err != cudaSuccess) {
+    std::cerr << "cudaMemcpy2D(Async)? failed: " << cudaGetErrorString(err)
+              << std::endl;
+    return -1;
+  }
+  err = cudaStreamSynchronize(0);
+  if (err != cudaSuccess) {
+    std::cerr << "cudaStreamSynchronize failed: " << cudaGetErrorString(err)
+              << std::endl;
+    return -1;
+  }
+  return 0;
+}
+
 int copyNv12IntoEncoderBuffer(NvBufSurface *src_surf, NvBuffer *dst_buffer,
                               uint32_t *y_bytes, uint32_t *uv_bytes) {
   if (NvBufSurfaceMap(src_surf, 0, -1, NVBUF_MAP_READ_WRITE) != 0) return -1;
@@ -472,7 +574,8 @@ void streamingThreadFunction() {
   std::cout << "Effective stream: " << width << "x" << height << "@" << cfg.fps
             << " bitrate=" << cfg.bitrate << std::endl;
 
-  // Allocate NvBufSurfaces.
+  // Allocate NvBufSurfaces.  The BGRA input must be SURFACE_ARRAY for VIC.
+  // In GPU-retrieve mode we expose it to CUDA via an EGL bridge.
   NvBufSurface *bgra = nullptr;
   NvBufSurface *nv12 = nullptr;
   if (allocateBgraSurface(&bgra, width, height) != 0 ||
@@ -481,6 +584,19 @@ void streamingThreadFunction() {
     zed.close();
     return;
   }
+
+  EglCudaBridge egl_bridge;
+  if (!cpu_retrieve) {
+    if (setupEglCudaBridge(bgra, &egl_bridge) != 0) {
+      std::cerr << "EGL/CUDA bridge setup failed; falling back to CPU retrieve"
+                << std::endl;
+      cpu_retrieve = true;
+    }
+  }
+  std::cout << "Input path: "
+            << (cpu_retrieve ? "CPU retrieve + host memcpy"
+                              : "GPU retrieve + cudaMemcpy2DAsync via EGL/CUDA")
+            << std::endl;
 
   // VIC transform params (full-frame, no crop).
   NvBufSurfTransformRect src_rect = {0, 0, width, height};
@@ -579,20 +695,31 @@ void streamingThreadFunction() {
     SteadyClock::time_point t0 = SteadyClock::now();
     if (zed.grab() != sl::ERROR_CODE::SUCCESS) continue;
     SteadyClock::time_point t1 = SteadyClock::now();
-    if (zed.retrieveImage(zed_image, view, sl::MEM::CPU) !=
+    const sl::MEM zed_mem = cpu_retrieve ? sl::MEM::CPU : sl::MEM::GPU;
+    if (zed.retrieveImage(zed_image, view, zed_mem) !=
         sl::ERROR_CODE::SUCCESS)
       continue;
     SteadyClock::time_point t2 = SteadyClock::now();
-    const uint8_t *src = zed_image.getPtr<sl::uchar1>(sl::MEM::CPU);
-    if (!src || zed_image.getWidth() != width ||
-        zed_image.getHeight() != height) {
+    if (zed_image.getWidth() != width || zed_image.getHeight() != height) {
       continue;
     }
-    if (copyBgraIntoSurface(bgra, src,
-                             static_cast<uint32_t>(zed_image.getStepBytes(
-                                 sl::MEM::CPU)),
-                             width, height) != 0) {
-      break;
+    if (cpu_retrieve) {
+      const uint8_t *src = zed_image.getPtr<sl::uchar1>(sl::MEM::CPU);
+      if (!src) continue;
+      if (copyBgraIntoSurface(bgra, src,
+                               static_cast<uint32_t>(zed_image.getStepBytes(
+                                   sl::MEM::CPU)),
+                               width, height) != 0) {
+        break;
+      }
+    } else {
+      const void *src = zed_image.getPtr<sl::uchar1>(sl::MEM::GPU);
+      if (!src) continue;
+      if (copyBgraGpuViaEgl(&egl_bridge, src,
+                             zed_image.getStepBytes(sl::MEM::GPU), width,
+                             height) != 0) {
+        break;
+      }
     }
     SteadyClock::time_point t3 = SteadyClock::now();
     if (NvBufSurfTransform(bgra, nv12, &tparams) !=
@@ -656,6 +783,7 @@ void streamingThreadFunction() {
   std::cout << "Streaming loop exited; tearing down encoder/ZED" << std::endl;
   delete enc_state.enc;
   enc_state.enc = nullptr;
+  teardownEglCudaBridge(bgra, &egl_bridge);
   NvBufSurfaceDestroy(bgra);
   NvBufSurfaceDestroy(nv12);
   zed.close();
@@ -811,6 +939,8 @@ int main(int argc, char *argv[]) {
       bitrate_override = std::atoi(argv[++i]);
     } else if (a == "--dump-h264" && i + 1 < argc) {
       dump_h264_path = argv[++i];
+    } else if (a == "--cpu-retrieve") {
+      cpu_retrieve = true;
     } else if (a == "--help") {
       std::cout
           << "Usage: " << argv[0] << " [options]\n"
@@ -820,6 +950,7 @@ int main(int argc, char *argv[]) {
           << "  --stats-interval N    Log every N frames (default: 120)\n"
           << "  --bitrate BPS         Override H.264 bitrate (default: from PICO)\n"
           << "  --dump-h264 PATH      Also write the H.264 byte stream to PATH for debugging\n"
+          << "  --cpu-retrieve        Use CPU retrieve + host memcpy (default: GPU retrieve via EGL/CUDA)\n"
           << "  --help                This text\n"
           << "\n"
           << "Wire-protocol compatible with orinvideosender2; internal encode is\n"
