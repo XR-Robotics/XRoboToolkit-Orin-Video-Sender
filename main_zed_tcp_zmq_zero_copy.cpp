@@ -1310,7 +1310,12 @@ std::string buildPipelineString(const CameraRequestData &config,
       "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
       "leaky=downstream ! ";
 
-  pipeline_str += "nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
+  // videoconvert is required before nvvidconv on JetPack 35.x: nvvidconv
+  // negotiates BGRA but silently drops CPU-memory BGRA buffers, producing
+  // zero NV12 output. videoconvert lifts BGRA to a format nvvidconv will
+  // actually consume. Costs ~1-2ms CPU.
+  pipeline_str += "videoconvert ! nvvidconv ! "
+                  "video/x-raw(memory:NVMM),format=NV12 ! "
                   "tee name=t ";
 
   // Configure encoder based on settings
