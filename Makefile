@@ -126,8 +126,19 @@ m1_vic_convert: m1_vic_convert.cpp
 	$(CXX) -std=c++11 -O2 -g -Wall -Wextra $(MMAPI_INCLUDES) \
 		$< -o $@ $(MMAPI_LDFLAGS)
 
+# M2 needs ZED SDK + CUDA in addition to MMAPI.
+M2_INCLUDES := $(MMAPI_INCLUDES) -I/usr/local/zed/include -I/usr/local/cuda/include
+M2_LDFLAGS  := $(MMAPI_LDFLAGS) \
+	-L/usr/local/zed/lib -L/usr/local/cuda/lib64 \
+	-lsl_zed -lcuda -lcudart -lpthread
+
+m2_zed_vic_nv12: m2_zed_vic_nv12.cpp
+	@echo "Compiling+linking: $@"
+	$(CXX) -std=c++11 -O2 -g -Wall -Wextra $(M2_INCLUDES) \
+		$< -o $@ $(M2_LDFLAGS)
+
 clean:
-	rm -rf $(APP) $(OBJS) m1_vic_convert
+	rm -rf $(APP) $(OBJS) m1_vic_convert m2_zed_vic_nv12
 
 install: $(APP)
 	@echo "Installing $(APP)..."
